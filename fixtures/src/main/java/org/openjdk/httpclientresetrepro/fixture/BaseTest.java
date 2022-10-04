@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -77,7 +78,7 @@ public abstract class BaseTest {
       case "PUT":
       case "POST":
         try (InputStream in = inputStream.get()) {
-          input = in.readAllBytes();
+          input = readAll(in);
         }
         break;
       case "GET":
@@ -153,9 +154,25 @@ public abstract class BaseTest {
     con.getResponseCode(); // call to ensure http request is complete
 
     try (InputStream in = maybeDecompress(con)) {
-      byte[] received = in.readAllBytes();
+      byte[] received = readAll(in);
       assertThat(received).containsExactly(data);
     }
+  }
+
+  private static byte[] readAll(InputStream in) throws IOException {
+    // work around AssertionError from JDK-8228970, which wasn't back ported to Java 11
+    ByteArrayOutputStream os = new ByteArrayOutputStream();
+    byte[] buf = new byte[1024];
+    while (true) {
+      int rd = in.read(buf);
+      if (rd < 0) {
+        break;
+      }
+      if (rd > 0) {
+        os.write(buf, 0, rd);
+      }
+    }
+    return os.toByteArray();
   }
 
   protected static InputStream maybeDecompress(HttpURLConnection con) throws Exception {
@@ -215,7 +232,7 @@ public abstract class BaseTest {
         BodyHandlers.ofInputStream());
 
     try (InputStream in = maybeDecompress(response)) {
-      byte[] received = in.readAllBytes();
+      byte[] received = readAll(in);
       assertThat(received).containsExactly(data);
     }
   }
@@ -355,7 +372,7 @@ public abstract class BaseTest {
 
     try (CloseableHttpResponse response = apacheClient.execute(request)) {
       try (InputStream in = response.getEntity().getContent()) {
-        byte[] received = in.readAllBytes();
+        byte[] received = readAll(in);
         assertThat(received).containsExactly(data);
       }
     }
