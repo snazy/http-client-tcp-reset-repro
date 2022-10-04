@@ -19,10 +19,12 @@ import java.net.http.HttpRequest.BodyPublishers;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.concurrent.Flow;
 import java.util.concurrent.Flow.Subscriber;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.SubmissionPublisher;
 import java.util.function.IntSupplier;
 import java.util.function.Supplier;
@@ -59,7 +61,7 @@ public abstract class BaseTest {
   public static final int CONNECT_TIMEOUT = 5_000;
   public static final int READ_TIMEOUT = 5_000;
 
-  public static final String APPLICATION_OCTET_STREAM = "application/octet-stream";
+  public static final String CONTENT_TYPE = "application/json";
   public static final String GZIP = "gzip";
   public static final String DEFLATE = "deflate";
   public static final String ACCEPT_ENCODING = GZIP + ";q=1.0, " + DEFLATE + ";q=0.9";
@@ -73,7 +75,10 @@ public abstract class BaseTest {
   protected void requestHandler(String method, IntSupplier length,
       Supplier<InputStream> inputStream, Runnable before, Supplier<OutputStream> outputStream)
       throws IOException {
-    byte[] input;
+
+    System.err.println("REQUEST START: " + method);
+
+    String input;
     switch (method) {
       case "PUT":
       case "POST":
@@ -83,26 +88,30 @@ public abstract class BaseTest {
         break;
       case "GET":
       case "DELETE":
-        input = constructBlob(length.getAsInt());
+        input = constructPayload(length.getAsInt());
         break;
       default:
         fail();
         return;
     }
 
+    System.err.println("REQUEST FOO: " + method + " / " + input.length());
+
     before.run();
 
     try (OutputStream os = outputStream.get()) {
-      os.write(input);
+      writeAll(os, input);
     }
+
+    System.err.println("REQUEST COMPLETE: " + method + " / " + input.length());
   }
 
-  protected static byte[] constructBlob(int len) {
-    byte[] r = new byte[len];
+  protected static String constructPayload(int len) {
+    StringBuilder sb = new StringBuilder();
     for (int i = 0; i < len; i++) {
-      r[i] = (byte) i;
+      sb.append((char) ((i & 63) + 32));
     }
-    return r;
+    return sb.toString();
   }
 
   static Stream<Arguments> requestsAndPayload() {
@@ -130,8 +139,8 @@ public abstract class BaseTest {
     con.setReadTimeout(READ_TIMEOUT);
     con.setConnectTimeout(CONNECT_TIMEOUT);
 
-    con.addRequestProperty(HEADER_ACCEPT, APPLICATION_OCTET_STREAM);
-    con.addRequestProperty(HEADER_CONTENT_TYPE, APPLICATION_OCTET_STREAM);
+    con.addRequestProperty(HEADER_ACCEPT, CONTENT_TYPE);
+    con.addRequestProperty(HEADER_CONTENT_TYPE, CONTENT_TYPE);
     if (withCompression) {
       con.addRequestProperty(HEADER_ACCEPT_ENCODING, ACCEPT_ENCODING);
       if (write) {
@@ -141,12 +150,12 @@ public abstract class BaseTest {
 
     con.setRequestMethod(method);
 
-    byte[] data = constructBlob(payloadSize);
+    String data = constructPayload(payloadSize);
 
     if (write) {
       con.setDoOutput(true);
       try (OutputStream out = wrapOutputStream(con.getOutputStream(), withCompression)) {
-        out.write(data);
+        writeAll(out, data);
       }
     }
 
@@ -154,12 +163,23 @@ public abstract class BaseTest {
     con.getResponseCode(); // call to ensure http request is complete
 
     try (InputStream in = maybeDecompress(con)) {
-      byte[] received = readAll(in);
-      assertThat(received).containsExactly(data);
+      String received = readAll(in);
+      assertThat(received).isEqualTo(data);
     }
   }
 
-  private static byte[] readAll(InputStream in) throws IOException {
+  private static void writeAll(OutputStream out, String data) throws IOException {
+    byte[] b = data.getBytes(StandardCharsets.UTF_8);
+    for (int p = 0; p < b.length; ) {
+      int len = Math.min(1024, b.length - p);
+      if (len > 0) {
+        out.write(b, p, len);
+      }
+      p += len;
+    }
+  }
+
+  private static String readAll(InputStream in) throws IOException {
     // work around AssertionError from JDK-8228970, which wasn't back ported to Java 11
     ByteArrayOutputStream os = new ByteArrayOutputStream();
     byte[] buf = new byte[1024];
@@ -172,7 +192,7 @@ public abstract class BaseTest {
         os.write(buf, 0, rd);
       }
     }
-    return os.toByteArray();
+    return os.toString(StandardCharsets.UTF_8);
   }
 
   protected static InputStream maybeDecompress(HttpURLConnection con) throws Exception {
@@ -212,8 +232,8 @@ public abstract class BaseTest {
 
     HttpRequest.Builder request =
         HttpRequest.newBuilder().uri(u).timeout(Duration.ofMillis(READ_TIMEOUT))
-            .header(HEADER_ACCEPT, APPLICATION_OCTET_STREAM)
-            .header(HEADER_CONTENT_TYPE, APPLICATION_OCTET_STREAM);
+            .header(HEADER_ACCEPT, CONTENT_TYPE)
+            .header(HEADER_CONTENT_TYPE, CONTENT_TYPE);
     if (withCompression) {
       request.header(HEADER_ACCEPT_ENCODING, ACCEPT_ENCODING);
       if (write) {
@@ -221,7 +241,7 @@ public abstract class BaseTest {
       }
     }
 
-    byte[] data = constructBlob(payloadSize);
+    String data = constructPayload(payloadSize);
 
     BodyPublisher bodyPublisher =
         write ? BodyPublishers.fromPublisher(publishBody(data, withCompression))
@@ -232,8 +252,8 @@ public abstract class BaseTest {
         BodyHandlers.ofInputStream());
 
     try (InputStream in = maybeDecompress(response)) {
-      byte[] received = readAll(in);
-      assertThat(received).containsExactly(data);
+      String received = readAll(in);
+      assertThat(received).isEqualTo(data);
     }
   }
 
@@ -249,21 +269,26 @@ public abstract class BaseTest {
     }
   }
 
-  private static Flow.Publisher<ByteBuffer> publishBody(byte[] data, boolean withCompression) {
+  private static Flow.Publisher<ByteBuffer> publishBody(String data, boolean withCompression) {
     return new SubmissionPublisher<>() {
       @Override
       public void subscribe(Subscriber<? super ByteBuffer> subscriber) {
         super.subscribe(subscriber);
 
-        try {
-          try (OutputStream out = wrapOutputStream(new SubmittingOutputStream(this),
-              withCompression)) {
-            out.write(data);
+        ForkJoinPool.commonPool().submit(() -> {
+          try {
+            System.err.println("SUBSCRIBE...");
+            try (OutputStream out = wrapOutputStream(new SubmittingOutputStream(this),
+                withCompression)) {
+              writeAll(out, data);
+            }
+            System.err.println("WRITTEN...");
+            close();
+            System.err.println("CLOSED...");
+          } catch (Exception e) {
+            closeExceptionally(e);
           }
-          close();
-        } catch (Exception e) {
-          closeExceptionally(e);
-        }
+        });
       }
     };
   }
@@ -352,8 +377,8 @@ public abstract class BaseTest {
     URI u = uri.resolve(extra);
 
     HttpUriRequestBase request = new HttpUriRequestBase(method, u);
-    request.addHeader(HEADER_ACCEPT, APPLICATION_OCTET_STREAM);
-    request.addHeader(HEADER_CONTENT_TYPE, APPLICATION_OCTET_STREAM);
+    request.addHeader(HEADER_ACCEPT, CONTENT_TYPE);
+    request.addHeader(HEADER_CONTENT_TYPE, CONTENT_TYPE);
     if (withCompression) {
       request.addHeader(HEADER_ACCEPT_ENCODING, ACCEPT_ENCODING);
     }
@@ -362,18 +387,18 @@ public abstract class BaseTest {
         RequestConfig.copy(apacheRequestConfig).setContentCompressionEnabled(withCompression)
             .build());
 
-    byte[] data = constructBlob(payloadSize);
+    String data = constructPayload(payloadSize);
 
     if (write) {
       HttpEntity entity =
-          HttpEntities.create(os -> os.write(data), ContentType.parse(APPLICATION_OCTET_STREAM));
+          HttpEntities.create(os -> writeAll(os, data), ContentType.parse(CONTENT_TYPE));
       request.setEntity(entity);
     }
 
     try (CloseableHttpResponse response = apacheClient.execute(request)) {
       try (InputStream in = response.getEntity().getContent()) {
-        byte[] received = readAll(in);
-        assertThat(received).containsExactly(data);
+        String received = readAll(in);
+        assertThat(received).isEqualTo(data);
       }
     }
   }

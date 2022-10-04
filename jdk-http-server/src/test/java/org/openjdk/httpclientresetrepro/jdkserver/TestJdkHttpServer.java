@@ -36,7 +36,7 @@ public class TestJdkHttpServer extends BaseTest {
           }
           return in;
         }, () -> {
-          exchange.getResponseHeaders().add(HEADER_CONTENT_TYPE, APPLICATION_OCTET_STREAM);
+          exchange.getResponseHeaders().add(HEADER_CONTENT_TYPE, CONTENT_TYPE);
           List<String> acceptEncoding = exchange.getRequestHeaders()
               .get(HEADER_ACCEPT_ENCODING);
           if (acceptEncoding != null && !acceptEncoding.isEmpty()) {
