@@ -45,7 +45,7 @@ public class TestWithJetty11 extends BaseTest {
                 },
                 () -> {
                   response.setStatus(200);
-                  response.setContentType("application/octet-stream");
+                  response.setContentType(CONTENT_TYPE);
                 }
                 , () -> {
                   try {
@@ -59,7 +59,8 @@ public class TestWithJetty11 extends BaseTest {
 
     GzipHandler gzip = new GzipHandler();
     gzip.setInflateBufferSize(8192);
-    gzip.addIncludedMethods("PUT");
+    gzip.addIncludedMethods("PUT", "POST");
+    gzip.addIncludedMimeTypes(CONTENT_TYPE);
     server.setHandler(requestHandler);
     server.insertHandler(gzip);
     server.setRequestLog(
