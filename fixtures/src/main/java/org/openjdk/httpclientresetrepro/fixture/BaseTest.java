@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
 
 import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
@@ -19,6 +20,7 @@ import java.net.http.HttpClient.Version;
 import java.net.http.HttpRequest;
 import java.net.http.HttpRequest.BodyPublisher;
 import java.net.http.HttpRequest.BodyPublishers;
+import java.net.http.HttpRequest.Builder;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
 import java.nio.ByteBuffer;
@@ -30,9 +32,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Flow;
 import java.util.concurrent.Flow.Subscriber;
 import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.SubmissionPublisher;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -80,6 +85,7 @@ public abstract class BaseTest {
   public static final String HEADER_ACCEPT_ENCODING = "Accept-Encoding";
   public static final String HEADER_CONTENT_ENCODING = "Content-Encoding";
   public static final String HEADER_CONTENT_TYPE = "Content-Type";
+  public static final String[] METHODS = {"GET", "DELETE", "PUT", "POST"};
 
   protected URI uri;
 
@@ -130,24 +136,35 @@ public abstract class BaseTest {
   }
 
   static Stream<Arguments> requestsAndPayload() {
-    return Stream.of("POST", "PUT", "GET", "DELETE")
-        .flatMap(m -> IntStream.of(1000, 100_000, 10_000_000).boxed().flatMap(payloadSize -> {
-              boolean write = "PUT".equals(m) || "POST".equals(m);
-              String extra = write ? "" : ("?" + payloadSize);
-              return Stream.of(
-                  arguments(m, payloadSize, false, write, extra),
-                  arguments(m, payloadSize, true, write, extra)
-              );
-            }
-        ));
+    return IntStream.of(1000, 100_000, 1_000_000).boxed()
+        .flatMap(payloadSize ->
+            Stream.of("GET", "DELETE", "PUT", "POST").flatMap(m -> {
+                  boolean write = isWrite(m);
+                  String extra = write ? "" : ("?" + payloadSize);
+                  return Stream.of(
+                      arguments(m, payloadSize, false, write, extra),
+                      arguments(m, payloadSize, true, write, extra)
+                  );
+                }
+            ));
+  }
+
+  static Stream<Arguments> compressionAndPayload() {
+    return Stream.of(false, true).flatMap(compress ->
+        IntStream.of(1000, 100_000, 1_000_000).boxed()
+            .map(payloadSize -> arguments(payloadSize, compress)));
+  }
+
+  private static boolean isWrite(String method) {
+    return "PUT".equals(method) || "POST".equals(method);
   }
 
   //
 
   @ParameterizedTest
-  @ValueSource(ints = {1, 2, 5, 10})
+  @ValueSource(ints = {1, 2, 5})
   public void chunkedEagerRequests(int repetitions) throws Exception {
-    byte[] payload = constructPayload(131072).getBytes(US_ASCII);
+    byte[] uncompressedPayload = constructPayload(131072).getBytes(US_ASCII);
 
     String request = String.join("\r\n",
         "PUT / HTTP/1.1",
@@ -163,14 +180,14 @@ public abstract class BaseTest {
 
     ByteArrayOutputStream compressed = new ByteArrayOutputStream();
     try (GZIPOutputStream gzout = new GZIPOutputStream(compressed)) {
-      gzout.write(payload);
+      gzout.write(uncompressedPayload);
     }
-    payload = compressed.toByteArray();
+    byte[] compressedPayload = compressed.toByteArray();
 
     ByteArrayOutputStream requestData = new ByteArrayOutputStream();
     requestData.write(request.getBytes(US_ASCII));
-    requestData.write((Integer.toString(payload.length, 16) + "\r\n").getBytes(US_ASCII));
-    requestData.write(payload);
+    requestData.write((Integer.toString(compressedPayload.length, 16) + "\r\n").getBytes(US_ASCII));
+    requestData.write(compressedPayload);
     requestData.write("\r\n0\r\n\r\n".getBytes(US_ASCII));
 
     try (Socket socket = new Socket(uri.getHost(), uri.getPort())) {
@@ -241,7 +258,15 @@ public abstract class BaseTest {
             responseData = buffer.toByteArray();
           }
 
-          assertThat(responseData).isEqualTo(payload);
+          if (headers.containsKey("content-encoding")) {
+            ByteArrayOutputStream uncompressed = new ByteArrayOutputStream();
+            try (InputStream c = new GZIPInputStream(new ByteArrayInputStream(responseData))) {
+              c.transferTo(uncompressed);
+            }
+            responseData = uncompressed.toByteArray();
+          }
+
+          assertThat(responseData).isEqualTo(uncompressedPayload);
         }
       }
     }
@@ -316,7 +341,7 @@ public abstract class BaseTest {
   private static void writeAll(OutputStream out, String data) throws IOException {
     byte[] b = data.getBytes(StandardCharsets.UTF_8);
     for (int p = 0; p < b.length; ) {
-      int len = Math.min(1024, b.length - p);
+      int len = Math.min(8000, b.length - p);
       if (len > 0) {
         out.write(b, p, len);
       }
@@ -369,40 +394,68 @@ public abstract class BaseTest {
   }
 
   @ParameterizedTest
-  @MethodSource("requestsAndPayload")
-  protected void withNewJavaHttpClient(String method, int payloadSize, boolean withCompression,
-      boolean write, String extra)
+  @MethodSource("compressionAndPayload")
+  protected void withNewJavaHttpClient(int payloadSize, boolean withCompression)
       throws Exception {
-    URI u = uri.resolve(extra);
-    String data = write ? constructPayload(payloadSize) : null;
+    URI uriExtra = uri.resolve("?" + payloadSize);
+    String data = constructPayload(payloadSize);
 
-    for (int i = 0; i < 10; i++) {
+    BlockingQueue<HttpResponse<InputStream>> responses = new ArrayBlockingQueue<>(10);
 
-      HttpRequest.Builder request =
-          HttpRequest.newBuilder().uri(u).timeout(Duration.ofMillis(READ_TIMEOUT))
-              .header(HEADER_ACCEPT, CONTENT_TYPE)
-              .header(HEADER_CONTENT_TYPE, CONTENT_TYPE);
-      if (withCompression) {
-        request.header(HEADER_ACCEPT_ENCODING, ACCEPT_ENCODING);
-        if (write) {
-          request.header(HEADER_CONTENT_ENCODING, GZIP);
+    int repetitions = 10;
+    Semaphore blocker = new Semaphore(1);
+
+    Thread submitter = new Thread(() -> {
+      for (int i = 0; i < repetitions; i++) {
+        try {
+          for (String method : METHODS) {
+            blocker.acquire();
+
+            next = blocker::release;
+
+            boolean write = isWrite(method);
+
+            Builder request =
+                HttpRequest.newBuilder().uri(write ? uri: uriExtra)
+                    .timeout(Duration.ofMillis(READ_TIMEOUT))
+                    .header(HEADER_ACCEPT, CONTENT_TYPE)
+                    .header(HEADER_CONTENT_TYPE, CONTENT_TYPE);
+            if (withCompression) {
+              request.header(HEADER_ACCEPT_ENCODING, ACCEPT_ENCODING);
+              if (write) {
+                request.header(HEADER_CONTENT_ENCODING, GZIP);
+              }
+            }
+
+            BodyPublisher bodyPublisher =
+                write ? BodyPublishers.fromPublisher(publishBody(data, withCompression))
+                    : BodyPublishers.noBody();
+
+            request.method(method, bodyPublisher);
+            HttpResponse<InputStream> response = javaHttpClient.send(request.build(),
+                BodyHandlers.ofInputStream());
+
+            responses.put(response);
+          }
+        } catch (Exception e) {
+          e.printStackTrace();
+          throw new RuntimeException(e);
         }
       }
+    });
+    submitter.start();
 
-      BodyPublisher bodyPublisher =
-          write ? BodyPublishers.fromPublisher(publishBody(data, withCompression))
-              : BodyPublishers.noBody();
-
-      request.method(method, bodyPublisher);
-      HttpResponse<InputStream> response = javaHttpClient.send(request.build(),
-          BodyHandlers.ofInputStream());
-
-      try (InputStream in = maybeDecompress(response)) {
-        String received = readAll(in);
-        if (data != null) {
-          assertThat(received).isEqualTo(data);
-        } else {
-          assertThat(received).hasSize(payloadSize);
+    for (int i = 0; i < repetitions; i++) {
+      for (String method : METHODS) {
+        HttpResponse<InputStream> response = responses.take();
+        try (InputStream in = maybeDecompress(response)) {
+          String received = readAll(in);
+          boolean write = isWrite(method);
+          if (write) {
+            assertThat(received).isEqualTo(data);
+          } else {
+            assertThat(received).hasSize(payloadSize);
+          }
         }
       }
     }
@@ -428,14 +481,11 @@ public abstract class BaseTest {
 
         ForkJoinPool.commonPool().submit(() -> {
           try {
-            System.err.println("SUBSCRIBE...");
             try (OutputStream out = wrapOutputStream(new SubmittingOutputStream(this),
                 withCompression)) {
               writeAll(out, data);
             }
-            System.err.println("WRITTEN...");
             close();
-            System.err.println("CLOSED...");
           } catch (Exception e) {
             closeExceptionally(e);
           }
